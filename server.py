@@ -4,13 +4,30 @@ import json
 import sys
 import ssl # Import the ssl module
 
-# Server configuration
+# --- CONFIGURATION ---
+# Set to True to use FQDN/public CA mode (Let's Encrypt, etc.)
+USE_FQDN = False
+
+# If using FQDN mode, set the cert/key paths for your public CA certs (Let's Encrypt)
+# Just copy the fullchain.pem and privkey.pem files to the same directory as this script, otherwise you will get FileNotFoundError
+FQDN_CERTFILE = './fullchain.pem'
+FQDN_KEYFILE = './privkey.pem'
+
+# If using self-signed mode, set the cert/key paths
+SELF_CERTFILE = 'server.crt'
+SELF_KEYFILE = 'server.key'
+
 HOST = '0.0.0.0'    # Listen on all available interfaces
 PORT = 12345        # Port to listen on
 
-# Paths to the server's certificate and private key - usually your laptop
-CERTFILE = 'server.crt'
-KEYFILE = 'server.key'
+if USE_FQDN:
+    CERTFILE = FQDN_CERTFILE
+    KEYFILE = FQDN_KEYFILE
+else:
+    CERTFILE = SELF_CERTFILE
+    KEYFILE = SELF_KEYFILE
+
+# --- END CONFIGURATION ---
 
 # Global dictionaries to manage connected clients and their information
 active_clients = {}  # Stores client_id: client_socket mapping
