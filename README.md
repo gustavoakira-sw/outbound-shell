@@ -1,39 +1,46 @@
-# Reverse terminal access tool
+# Interactive Reverse Shell with PTY
 
-This project provides a basic solution for remote terminal access to client machines via a central server using encrypted JSON messages sent and received over TCP sockets.
+This project provides a fully interactive reverse shell for remote terminal access, enabling the use of full-screen applications like `tmux` and `vim`. Communication is encrypted and managed through a central server.
 
-The client application runs on the remote machine and connects to the central server. The administrator then uses the server application to send commands to connected clients and receive their output.
+The client application runs on a remote machine, connects to the server, and spawns a pseudo-terminal (PTY). The administrator can then connect from the server to this PTY for a seamless, interactive session.
 
-This can be used when access to client machines is limited (no SSH) or if installation of reverse shells is not viable.
+This is ideal for environments where SSH is unavailable but interactive access is required.
 
-**Note:** You *will* need a server/laptop that can be reached by the client.
+**Note:** You will need a server/laptop that can be reached by the client.
 
 ## Architecture
 
-The system consists of two main components:
+The system has been refactored to use a pseudo-terminal (PTY) architecture:
 
-1.  **server (`server.py`):** Listens for incoming client connections, manages connected clients, and provides a command-line interface for the administrator to send commands and view output.
-2.  **client (`client.py`):** Connects to the central server, receives commands, executes them locally using `subprocess`, and sends the output back to the server.
+1.  **Server (`server.py`):** Listens for client connections, manages interactive sessions, and puts the local terminal into raw mode to relay all keystrokes.
+2.  **Client (`client.py`):** Connects to the server, forks a child process, and creates a PTY with a shell (e.g., `bash`). It then relays all I/O between the PTY and the server.
 
-## Communication protocol
+## Communication Protocol
 
-A simple JSON-based protocol over TCP sockets is used for communication between the server and clients.
+The communication protocol has been updated to support raw PTY data streams and terminal resizing events. All data payloads are Base64 encoded to ensure safe JSON transport.
 
-*   **command message (server to client):**
-
+*   **PTY Input (Server -> Client):**
     ```json
     {
-        "type": "command",
-        "command": "ls -la"
+        "type": "pty_input",
+        "data": "<base64_encoded_user_input>"
     }
     ```
 
-*   **output message (client to server):**
-
+*   **PTY Output (Client -> Server):**
     ```json
     {
-        "type": "output",
-        "output": "total 0\ndrwxr-xr-x  2 user  staff   64 Jan  1 10:00 .\ndrwxr-xr-x  2 user  staff   64 Jan  1 10:00 .."
+        "type": "pty_output",
+        "data": "<base64_encoded_pty_output>"
+    }
+    ```
+
+*   **Terminal Resize (Server -> Client):**
+    ```json
+    {
+        "type": "resize",
+        "rows": 24,
+        "cols": 80
     }
     ```
 
@@ -42,7 +49,7 @@ A simple JSON-based protocol over TCP sockets is used for communication between 
 ### Prerequisites
 
 *   Python 3.x installed on both the server and client machines.
-*   `openssl` for generating certificates on the server.
+*   `openssl` for generating certificates on the server (if using self-signed certificate mode).
 
 ### 1. Generate self-signed certificates
 
@@ -73,10 +80,8 @@ You will see output similar to:
 --- Remote Terminal Access Server ---
 Commands:
   list                - List all connected clients
-  select <client_id>  - Select a client to send commands to
-  unselect            - Unselect the current client
+  interact <client_id> - Start an interactive session with a client
   exit                - Shut down the server
-  <command>           - Send command to selected client (or client_id:command)
 -------------------------------------
 [*] Listening securely on 0.0.0.0:12345
 ```
@@ -93,13 +98,13 @@ Once a client connects, the server terminal will show messages about the SSL han
 
 ### 3. Interact from the server
 
-In the server terminal (where `server.py` is running), you can now send commands to the connected clients. The prompt will dynamically update to reflect the selected client (e.g., `user@hostname # `).
+In the server terminal (where `server.py` is running), you can now start an interactive session with any connected client.
 
 *   **`list`**: List all connected clients and their IDs.
-*   **`select <client_id>`**: Select a specific client to send commands to. The prompt will change to `user@hostname # `.
-*   **`unselect`**: Deselect the current client. The prompt will revert to `Enter command (client_id:command): `.
-*   **`<command>`**: Send a command to the currently selected client. For example, `ls -la`.
-*   **`<client_id>:<command>`**: Send a command to a specific client without explicitly selecting it. For example, `1:pwd`.
+*   **`interact <client_id>`**: Start a fully interactive session with the specified client.
+    *   Your terminal will go into raw mode, and all keystrokes will be sent to the remote shell.
+    *   This supports `tmux`, `vim`, and other full-screen applications.
+    *   Press `Ctrl+D` (or your terminal's EOF character) to exit the interactive session.
 *   **`exit`**: Shut down the server.
 
 ## Troubleshooting
