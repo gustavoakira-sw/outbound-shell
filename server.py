@@ -2,11 +2,17 @@ import socket
 import threading
 import json
 import sys
-import ssl # Import the ssl module
+import ssl
+import os
+import tty
+import termios
+import select
+import signal
+import base64
 
 # --- CONFIGURATION ---
 # Set to True to use FQDN/public CA mode (Let's Encrypt, etc.)
-USE_FQDN = False
+USE_FQDN = True
 
 # If using FQDN mode, set the cert/key paths for your public CA certs (Let's Encrypt)
 # Just copy the fullchain.pem and privkey.pem files to the same directory as this script, otherwise you will get FileNotFoundError
@@ -32,6 +38,7 @@ else:
 # Global dictionaries to manage connected clients and their information
 active_clients = {}  # Stores client_id: client_socket mapping
 client_details = {}  # Stores client_id: client_info (e.g., 'user@hostname')
+client_events = {}   # Stores client_id: threading.Event for signaling
 next_client_id = 1   # Counter for assigning unique client IDs
 
 def send_message(sock, message):
@@ -51,66 +58,31 @@ def receive_message(sock):
     # print(f"Received message: {message} with length {message_length}")  # debug
     return json.loads(message)
 
-def handle_client(client_socket, addr, client_id):
-    """Handles communication with a connected client."""
-    client_address = f"{addr[0]}:{addr[1]}" # addr is a tuple of (ip, port)
+def handle_client(client_socket, addr, client_id, stop_event):
+    """Handles the initial connection and info gathering for a client."""
+    client_address = f"{addr[0]}:{addr[1]}"
     print(f"[*] Accepted connection from: {client_address} (Client ID: {client_id})")
     active_clients[client_id] = client_socket
-    # print(f"Active clients: {active_clients}") # debug
-    client_details[client_id] = client_address # client_address is updated once connected
+    client_details[client_id] = client_address
+    client_events[client_id] = stop_event
 
     try:
-        while True:
-            data = receive_message(client_socket)
-            if data is None: # Client disconnected gracefully
-                break
+        # First message should be client info
+        data = receive_message(client_socket)
+        if data and data['type'] == 'info' and 'hostname' in data:
+            client_details[client_id] = data['hostname']
+            print(f"\n[*] Client {client_id} updated info: {data['hostname']}")
+            sys.stdout.write(get_prompt_string())
+            sys.stdout.flush()
+        
+        # Wait until an interactive session is requested
+        stop_event.wait()
 
-            if data['type'] == 'output':
-                output_content = data['output']
-                # print(f"Output content: {output_content}")
-                client_prompt_prefix = f"{client_details.get(client_id, '')} # "
-
-                # Clean the output to remove the client prompt prefix - this is a hack to make the output look nicer
-                cleaned_lines = []
-                for line in output_content.splitlines():
-                    if line.startswith(client_prompt_prefix):
-                        cleaned_lines.append(line[len(client_prompt_prefix):].lstrip())
-                    else:
-                        cleaned_lines.append(line)
-                
-                # Join the cleaned lines back together with a newline
-                processed_output = '\n'.join(cleaned_lines)
-                if not processed_output.endswith('\n'):
-                    processed_output += '\n'
-
-                sys.stdout.write('\r\033[K') # Clear the current line and redraw the prompt
-                sys.stdout.write(processed_output)
-                sys.stdout.flush()
-
-                sys.stdout.write(get_prompt_string()) # Redraw the prompt
-                sys.stdout.flush()
-            elif data['type'] == 'info' and 'hostname' in data:
-                # Update the client details with the hostname
-                client_details[client_id] = data['hostname']
-                print(f"\n[*] Client {client_id} updated info: {data['hostname']}")
-                sys.stdout.write(get_prompt_string())
-                sys.stdout.flush()
-
-    except ssl.SSLError as e:
-        # This should not happen, and is a bad implementation
-        print(f"\n[-] SSL Error with client {client_address} (Client ID: {client_id}): {e}")
     except Exception as e:
-        print(f"\n[*] Error handling client {client_address} (Client ID: {client_id}): {e}")
+        print(f"\n[*] Error with client {client_address} (Client ID: {client_id}) before interaction: {e}")
     finally:
-        # Clean up the client's data
-        if client_id in active_clients:
-            del active_clients[client_id]
-        if client_id in client_details:
-            del client_details[client_id]
-        client_socket.close()
-        print(f"\n[*] Client {client_address} (Client ID: {client_id}) disconnected.")
-        sys.stdout.write(get_prompt_string())
-        sys.stdout.flush()
+        # This thread will now terminate, handing over control to the main thread
+        print(f"\n[*] Handing over client {client_id} to interactive session.")
 
 def get_prompt_string():
     """Returns the current prompt string based on selected client."""
@@ -119,6 +91,58 @@ def get_prompt_string():
     return "Enter command (client_id:command): "
 
 selected_client_id = None # Track which client is currently selected for commands
+
+def interactive_session(client_socket):
+    """Handles an interactive PTY session with a client."""
+    
+    # Save old terminal settings
+    old_settings = termios.tcgetattr(sys.stdin.fileno())
+    
+    def resize_handler(signum, frame):
+        rows, cols = os.get_terminal_size()
+        send_message(client_socket, {'type': 'resize', 'rows': rows, 'cols': cols})
+
+    signal.signal(signal.SIGWINCH, resize_handler)
+
+    try:
+        # Set terminal to raw mode
+        tty.setraw(sys.stdin.fileno())
+        
+        # Initial resize
+        resize_handler(None, None)
+
+        while True:
+            r, w, e = select.select([client_socket, sys.stdin], [], [])
+
+            if client_socket in r:
+                # Data from client -> write to stdout
+                message_length_raw = client_socket.recv(64)
+                if not message_length_raw:
+                    break
+                message_length = int(message_length_raw.decode('utf-8').strip())
+                message_raw = client_socket.recv(message_length)
+                if not message_raw:
+                    break
+                
+                data = json.loads(message_raw.decode('utf-8'))
+                if data['type'] == 'pty_output':
+                    sys.stdout.write(base64.b64decode(data['data']).decode('utf-8', 'replace'))
+                    sys.stdout.flush()
+
+            if sys.stdin in r:
+                # Data from stdin -> send to client
+                user_input = os.read(sys.stdin.fileno(), 1024)
+                if user_input:
+                    encoded_input = base64.b64encode(user_input).decode('utf-8')
+                    send_message(client_socket, {'type': 'pty_input', 'data': encoded_input})
+                else:
+                    # Ctrl+D or similar
+                    break
+    
+    finally:
+        # Restore terminal settings
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
+        signal.signal(signal.SIGWINCH, signal.SIG_DFL) # Restore default handler
 
 def start_server():
     """Starts the main server listener and client handling threads."""
@@ -146,9 +170,10 @@ def start_server():
             print(f"[*] SSL Handshake successful with {addr[0]}:{addr[1]}")
 
             current_client_id = next_client_id
-            client_handler = threading.Thread(target=handle_client, args=(secure_client_socket, addr, current_client_id))
-            client_handler.daemon = True # Allow main program to exit even if threads are running
-            client_handler.start() # Start the thread
+            stop_event = threading.Event()
+            client_handler = threading.Thread(target=handle_client, args=(secure_client_socket, addr, current_client_id, stop_event))
+            client_handler.daemon = True
+            client_handler.start()
             next_client_id += 1
             # Automatically select the latest connected client
             selected_client_id = current_client_id
@@ -176,7 +201,7 @@ if __name__ == "__main__":
     print("\n--- Remote Terminal Access Server ---")
     print("Commands:")
     print("  list                - List all connected clients")
-    print("  select <client_id>  - Select a client to send commands to")
+    print("  interact <client_id> - Start an interactive session with a client")
     print("  unselect            - Unselect the current client")
     print("  exit                - Shut down the server")
     print("  <command>           - Send command to selected client (or client_id:command)")
@@ -197,16 +222,33 @@ if __name__ == "__main__":
                 print("Connected Clients:")
                 for client_id, client_info in client_details.items():
                     print(f"- Client ID: {client_id} ({client_info})")
-        elif command_input.lower().startswith('select '):
+        elif command_input.lower().startswith('interact '):
             try:
                 client_id_to_select = int(command_input.split(' ')[1])
                 if client_id_to_select in active_clients:
-                    selected_client_id = client_id_to_select
-                    print(f"Selected client: {client_details[selected_client_id]}")
+                    print(f"Starting interactive session with client: {client_details[client_id_to_select]}")
+                    print("Press Ctrl+D (or your terminal's EOF character) to exit the session.")
+                    
+                    # Signal the handle_client thread to stop
+                    client_events[client_id_to_select].set()
+                    
+                    client_socket = active_clients.pop(client_id_to_select)
+                    
+                    interactive_session(client_socket)
+                    
+                    print("\nSession ended.")
+                    if client_id_to_select in client_details:
+                        del client_details[client_id_to_select]
+                    if client_id_to_select in client_events:
+                        del client_events[client_id_to_select]
+                    
+                    client_socket.close()
+                    print(f"[*] Client {client_id_to_select} disconnected.")
+                    selected_client_id = None
                 else:
-                    print(f"Client with ID {client_id_to_select} not found.") # Again, should not happen
+                    print(f"Client with ID {client_id_to_select} not found.")
             except (IndexError, ValueError):
-                print("Invalid select command. Use 'select <client_id>'.")
+                print("Invalid interact command. Use 'interact <client_id>'.")
         elif command_input.lower() == 'unselect':
             selected_client_id = None
             print("Client unselected.")
@@ -223,8 +265,7 @@ if __name__ == "__main__":
                     print("Invalid command format. Use 'client_id:command' or 'command' after selecting a client.")
                     continue
 
-            if target_client_id and target_client_id in active_clients:
-                print(f"{client_details[target_client_id]} # {command_to_send}") # Print the command to the server terminal
-                send_message(active_clients[target_client_id], {'type': 'command', 'command': command_to_send}) # Send the command to the client
-            else:
-                print("No client selected or invalid client ID. Please select a client first or use 'client_id:command'.")
+            if command_input and selected_client_id and selected_client_id in active_clients:
+                 print("Interactive mode is required. Use 'interact <client_id>'.")
+            elif command_input:
+                 print("No client selected. Use 'list' to see clients and 'interact <client_id>' to connect.")
