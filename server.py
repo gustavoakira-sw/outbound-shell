@@ -107,9 +107,6 @@ def interactive_session(client_socket):
     try:
         # Set terminal to raw mode
         tty.setraw(sys.stdin.fileno())
-        
-        # Initial resize
-        resize_handler(None, None)
 
         while True:
             r, w, e = select.select([client_socket, sys.stdin], [], [])
