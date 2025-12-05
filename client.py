@@ -16,7 +16,7 @@ import struct
 USE_FQDN = True
 
 # If using FQDN mode, set the FQDN here (e.g., 'shell.gustavoakira.tech')
-SERVER_FQDN = 'api.gustavoakira.tech'
+SERVER_FQDN = 'gustavoakira.tech'
 # If using self-signed mode, set the IP and cert file
 SERVER_IP = '192.168.0.132'
 CA_CERTFILE = 'server.crt'

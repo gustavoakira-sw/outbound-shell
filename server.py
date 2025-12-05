@@ -12,10 +12,12 @@ import base64
 
 # --- CONFIGURATION ---
 # Set to True to use FQDN/public CA mode (Let's Encrypt, etc.)
-USE_FQDN = True
+USE_FQDN = False
 
 # If using FQDN mode, set the cert/key paths for your public CA certs (Let's Encrypt)
-# Just copy the fullchain.pem and privkey.pem files to the same directory as this script, otherwise you will get FileNotFoundError
+# Either copy the fullchain.pem and privkey.pem files to the same directory as this script,
+# or create a symlink if using live certificates from a proxy (nginx, caddy, etc.)
+# Invalid symlinks or missing files will result in FileNotFoundError
 FQDN_CERTFILE = './fullchain.pem'
 FQDN_KEYFILE = './privkey.pem'
 
